@@ -23,7 +23,7 @@ struct FundingInfo {
 }
 
 impl FundingInfo {
-    /// Converts the hourly funding rate to an annualized percentage
+    /// Converts the hourly predictive funding rate to an annualized percentage
     fn get_annualized_rate(&self) -> Option<f64> {
         self.funding_rate.as_ref().and_then(|rate_str| {
             rate_str.parse::<f64>().ok().map(|hourly_rate| {
@@ -41,6 +41,47 @@ struct PredictedFundingRequest {
 }
 
 type PredictedFundingResponse = Vec<(String, Vec<(String, Option<FundingInfo>)>)>;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AssetContextsRequest {
+    r#type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AssetUniverse {
+    name: String,
+    #[serde(rename = "szDecimals")]
+    sz_decimals: i32,
+    #[serde(rename = "maxLeverage")]
+    max_leverage: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AssetContext {
+    #[serde(rename = "dayNtlVlm")]
+    day_notional_volume: String,
+    funding: String,
+    #[serde(rename = "impactPxs")]
+    impact_prices: Option<[String; 2]>,
+    #[serde(rename = "markPx")]
+    mark_price: String,
+    #[serde(rename = "midPx")]
+    mid_price: Option<String>,
+    #[serde(rename = "openInterest")]
+    open_interest: String,
+    #[serde(rename = "oraclePx")]
+    oracle_price: String,
+    premium: Option<String>,
+    #[serde(rename = "prevDayPx")]
+    prev_day_price: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MetaData {
+    universe: Vec<AssetUniverse>,
+}
+
+type AssetContextsResponse = (MetaData, Vec<AssetContext>);
 
 struct HyperLiquidClient {
     client: Client,
@@ -70,12 +111,35 @@ impl HyperLiquidClient {
         let funding_data: PredictedFundingResponse = response.json().await?;
         Ok(funding_data)
     }
+
+    async fn get_asset_contexts(&self) -> Result<AssetContextsResponse, Box<dyn std::error::Error>> {
+        let request_body = AssetContextsRequest {
+            r#type: "metaAndAssetCtxs".to_string(),
+        };
+
+        let response = self
+            .client
+            .post(&format!("{}/info", self.base_url))
+            .json(&request_body)
+            .send()
+            .await?;
+
+        // Debug: print the raw response text before attempting to decode
+        let response_text = response.text().await?;
+        
+        let asset_data: AssetContextsResponse = serde_json::from_str(&response_text)?;
+        Ok(asset_data)
+    }
 }
 
 struct MetricsCollector {
     registry: Registry,
-    funding_rate_gauge: GaugeVec,
-    funding_rate_changes: CounterVec,
+    predictive_funding_rate_gauge: GaugeVec,
+    predictive_funding_rate_changes: CounterVec,
+    current_funding_rate_gauge: GaugeVec,
+    daily_volume_gauge: GaugeVec,
+    mid_price_gauge: GaugeVec,
+    prev_day_price_gauge: GaugeVec,
     previous_rates: Arc<tokio::sync::Mutex<HashMap<String, f64>>>,
 }
 
@@ -83,23 +147,51 @@ impl MetricsCollector {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let registry = Registry::new();
         
-        let funding_rate_gauge = GaugeVec::new(
-            Opts::new("hyperliquid_funding_rate", "Current funding rate for each coin and venue"),
+        let predictive_funding_rate_gauge = GaugeVec::new(
+            Opts::new("hyperliquid_predictive_funding_rate", "Current predictive funding rate for each coin and venue"),
             &["coin", "venue"]
         )?;
         
-        let funding_rate_changes = CounterVec::new(
-            Opts::new("hyperliquid_funding_rate_changes_total", "Total number of funding rate changes"),
+        let predictive_funding_rate_changes = CounterVec::new(
+            Opts::new("hyperliquid_predictive_funding_rate_changes_total", "Total number of predictive funding rate changes"),
             &["coin", "venue", "direction"]
         )?;
+
+        let current_funding_rate_gauge = GaugeVec::new(
+            Opts::new("hyperliquid_current_funding_rate", "Current funding rate for each coin from asset contexts"),
+            &["coin"]
+        )?;
+
+        let daily_volume_gauge = GaugeVec::new(
+            Opts::new("hyperliquid_daily_volume", "Daily notional volume for each coin"),
+            &["coin"]
+        )?;
+
+        let mid_price_gauge = GaugeVec::new(
+            Opts::new("hyperliquid_mid_price", "Current mid price for each coin"),
+            &["coin"]
+        )?;
+
+        let prev_day_price_gauge = GaugeVec::new(
+            Opts::new("hyperliquid_prev_day_price", "Previous day price for each coin"),
+            &["coin"]
+        )?;
         
-        registry.register(Box::new(funding_rate_gauge.clone()))?;
-        registry.register(Box::new(funding_rate_changes.clone()))?;
+        registry.register(Box::new(predictive_funding_rate_gauge.clone()))?;
+        registry.register(Box::new(predictive_funding_rate_changes.clone()))?;
+        registry.register(Box::new(current_funding_rate_gauge.clone()))?;
+        registry.register(Box::new(daily_volume_gauge.clone()))?;
+        registry.register(Box::new(mid_price_gauge.clone()))?;
+        registry.register(Box::new(prev_day_price_gauge.clone()))?;
         
         Ok(Self {
             registry,
-            funding_rate_gauge,
-            funding_rate_changes,
+            predictive_funding_rate_gauge,
+            predictive_funding_rate_changes,
+            current_funding_rate_gauge,
+            daily_volume_gauge,
+            mid_price_gauge,
+            prev_day_price_gauge,
             previous_rates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
@@ -113,14 +205,14 @@ impl MetricsCollector {
                     if let Some(annualized_rate) = funding_info.get_annualized_rate() {
                         let key = format!("{}:{}", coin, venue);
                         
-                        self.funding_rate_gauge
+                        self.predictive_funding_rate_gauge
                             .with_label_values(&[coin, venue])
                             .set(annualized_rate);
                         
                         if let Some(&previous_rate) = previous_rates.get(&key) {
                             if annualized_rate != previous_rate {
                                 let direction = if annualized_rate > previous_rate { "up" } else { "down" };
-                                self.funding_rate_changes
+                                self.predictive_funding_rate_changes
                                     .with_label_values(&[coin, venue, direction])
                                     .inc();
                             }
@@ -128,6 +220,47 @@ impl MetricsCollector {
                         
                         previous_rates.insert(key, annualized_rate);
                     }
+                }
+            }
+        }
+    }
+
+    async fn update_asset_metrics(&self, asset_data: &AssetContextsResponse) {
+        let (meta_data, contexts) = asset_data;
+        let universe = &meta_data.universe;
+        
+        for (i, context) in contexts.iter().enumerate() {
+            if let Some(coin_info) = universe.get(i) {
+                let coin_name = &coin_info.name;
+                
+                // Parse and set daily volume
+                if let Ok(volume) = context.day_notional_volume.parse::<f64>() {
+                    self.daily_volume_gauge
+                        .with_label_values(&[coin_name])
+                        .set(volume);
+                }
+                
+                // Parse and set mid price (handle None case)
+                if let Some(ref mid_price_str) = context.mid_price {
+                    if let Ok(mid_price) = mid_price_str.parse::<f64>() {
+                        self.mid_price_gauge
+                            .with_label_values(&[coin_name])
+                            .set(mid_price);
+                    }
+                }
+                
+                // Parse and set previous day price
+                if let Ok(prev_price) = context.prev_day_price.parse::<f64>() {
+                    self.prev_day_price_gauge
+                        .with_label_values(&[coin_name])
+                        .set(prev_price);
+                }
+                
+                // Parse and set current funding rate
+                if let Ok(funding_rate) = context.funding.parse::<f64>() {
+                    self.current_funding_rate_gauge
+                        .with_label_values(&[coin_name])
+                        .set(funding_rate);
                 }
             }
         }
@@ -185,13 +318,25 @@ async fn polling_loop(client: HyperLiquidClient, metrics: Arc<MetricsCollector>)
     loop {
         interval.tick().await;
         
+        // Fetch predicted funding rates
         match client.get_predicted_fundings().await {
             Ok(funding_data) => {
                 metrics.update_metrics(&funding_data).await;
-                println!("Updated metrics for {} coins", funding_data.len());
+                println!("Updated predictive funding metrics for {} coins", funding_data.len());
             }
             Err(e) => {
                 eprintln!("Error fetching funding data: {}", e);
+            }
+        }
+
+        // Fetch asset contexts (daily volume, prices, etc.)
+        match client.get_asset_contexts().await {
+            Ok(asset_data) => {
+                metrics.update_asset_metrics(&asset_data).await;
+                println!("Updated asset context metrics for {} coins", asset_data.1.len());
+            }
+            Err(e) => {
+                eprintln!("Error fetching asset context data: {}", e);
             }
         }
     }
