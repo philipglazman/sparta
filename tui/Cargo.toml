@@ -1,0 +1,14 @@
+[package]
+name = "trade-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono.workspace = true
+crossterm.workspace = true
+open.workspace = true
+ratatui.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
