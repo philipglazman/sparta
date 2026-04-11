@@ -303,7 +303,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 Span::styled("[2] ", Style::default().fg(Color::Yellow)),
                 Span::raw("TradingEconomics  "),
                 Span::styled("[3] ", Style::default().fg(Color::Yellow)),
-                Span::raw("MangoWorks"),
+                Span::raw("MangoWorks  "),
+                Span::styled("[4] ", Style::default().fg(Color::Yellow)),
+                Span::raw("Kiyotaka"),
             ]);
 
             let links_panel = Paragraph::new(links_text).block(

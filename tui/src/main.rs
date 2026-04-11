@@ -18,6 +18,7 @@ const LINKS: &[&str] = &[
     "https://velo.xyz/chart",
     "https://tradingeconomics.com/calendar",
     "https://mangoworks.grafana.net/d/pht2wll/hl",
+    "https://chart.kiyotaka.ai/",
 ];
 
 #[tokio::main]
@@ -107,6 +108,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()
                             KeyCode::Char('1') => { let _ = open::that(LINKS[0]); }
                             KeyCode::Char('2') => { let _ = open::that(LINKS[1]); }
                             KeyCode::Char('3') => { let _ = open::that(LINKS[2]); }
+                            KeyCode::Char('4') => { let _ = open::that(LINKS[3]); }
                             KeyCode::Char('p') => {
                                 app.pnl.active = true;
                             }
